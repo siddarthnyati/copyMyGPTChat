@@ -649,6 +649,17 @@ def _current_window_title(pid: int) -> str:
     return t.strip() if isinstance(t, str) else ""
 
 
+def _has_chat_pane(pid: int) -> bool:
+    """True iff ChatGPT is currently showing a message pane, i.e. a
+    real chat view (not Edit project, not an empty window state).
+    Used as the ground-truth check for 'did we exit view mode?' —
+    title-based checks alone are insufficient because an empty
+    window has title '' which isn't in _VIEW_MODE_TITLES but also
+    isn't a usable state."""
+    pane_frame, _pane_sa, msg_list = find_message_pane(pid)
+    return pane_frame is not None and msg_list is not None
+
+
 def _dismiss_modal_if_present(pid: int) -> bool:
     """Return ChatGPT.app to a state where sidebar clicks switch chats.
 
@@ -668,53 +679,50 @@ def _dismiss_modal_if_present(pid: int) -> bool:
     if not title:
         return False
 
-    # --- View modes: Escape doesn't exit these. Try, in order:
-    #     1. Cmd+W to close the offending window (if it's separate
-    #        from the main chat window).
-    #     2. The "ChatGPT" sidebar home button, pressed both via
-    #        AXPress and a real cg_click.
-    #     3. Cmd+N to force a brand new chat.
+    # --- View modes: Escape doesn't exit these.
+    # Empirically, on this ChatGPT.app build, *none* of the automated
+    # unstick attempts we tried work reliably:
+    #   * AXPress on the sidebar home button — err=0, does nothing.
+    #   * cg_click on the same — nothing.
+    #   * Cmd+W — closes the only window; re-activating reopens it in
+    #     the same state.
+    #   * Cmd+N — does nothing while in this view.
+    # So the honest move is to detect the state, tell the user what to
+    # do in one sentence, and refuse to run. One manual click from the
+    # user is cheaper than five minutes of failed clicks from us.
     if title in _VIEW_MODE_TITLES:
-        log.warning("ChatGPT.app is in '%s' view; attempting recovery.", title)
+        log.warning("ChatGPT.app is in '%s' view. Dumping window state.", title)
         _log_windows(pid)
 
-        # Attempt 1: Cmd+W. If Edit project is a separate window or a
-        # sheet, this closes it outright.
-        _close_window_with_cmd_w(pid)
-        after = _current_window_title(pid)
-        log.info("After Cmd+W: title=%r", after)
-        if after not in _VIEW_MODE_TITLES:
-            return True
-
-        # Attempt 2: press the home button (AXPress + real click).
-        _press_home_button(pid)
-        time.sleep(0.8)
-        after = _current_window_title(pid)
-        log.info("After home-button press: title=%r", after)
-        if after not in _VIEW_MODE_TITLES:
-            return True
-
-        # Attempt 3: Cmd+N.
-        log.warning("Still in '%s'; sending Cmd+N to open a new chat.", after)
+        # One best-effort Cmd+N attempt — cheap, and if it ever does
+        # work on some ChatGPT build we save the user a manual click.
+        # If it doesn't, we'll fail hard immediately below.
+        log.info("Trying Cmd+N one time to see if it exits the view")
         osa_cmd_key("n")
-        time.sleep(0.8)
-        final = _current_window_title(pid)
-        log.info("View-mode recovery: before=%r after=%r", title, final)
-        if final in _VIEW_MODE_TITLES:
-            log.error(
-                "All automated recovery attempts failed. ChatGPT is "
-                "still in '%s' view. Manually click the 'ChatGPT' "
-                "button at the top of the sidebar (or close the "
-                "current window with Cmd+W), then re-run the script.",
-                final,
-            )
-            print(
-                f"\n!!! ChatGPT.app is stuck in '{final}' view. Close the "
-                f"Edit-project window (Cmd+W) or click the 'ChatGPT' "
-                f"button at the top of the sidebar, then re-run.\n",
-                flush=True,
-            )
-        return True
+        time.sleep(1.2)
+        after = _current_window_title(pid)
+        log.info("After Cmd+N: title=%r", after)
+        if after not in _VIEW_MODE_TITLES and _has_chat_pane(pid):
+            log.info("Cmd+N exited '%s' view successfully", title)
+            return True
+
+        # Give up and exit clearly. Exiting here (vs failing every row
+        # silently) saves ~90s per run.
+        msg = (
+            f"\n=== ChatGPT.app is stuck in '{title}' view ===\n"
+            f"Automated recovery did not work. Please do this:\n"
+            f"  1. Click on the ChatGPT.app window.\n"
+            f"  2. In the sidebar, click any regular chat (NOT a\n"
+            f"     chat inside a project, and NOT the Projects/GPTs\n"
+            f"     sections). You should see a normal chat view with\n"
+            f"     a message pane on the right.\n"
+            f"  3. Re-run: python export_chatgpt.py --limit 3\n"
+            f"If the issue persists, paste the first ~30 lines of\n"
+            f"~/chatgpt_exports/.log and we'll keep debugging.\n"
+        )
+        log.error(msg.replace("\n", " | "))
+        print(msg, flush=True)
+        sys.exit(2)
 
     # --- True modal dialogs: Escape usually dismisses them ---
     if title in _MODAL_WINDOW_TITLES:
