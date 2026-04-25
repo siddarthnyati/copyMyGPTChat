@@ -332,6 +332,67 @@ class Conversation:
         return hashlib.sha1(raw).hexdigest()[:16]
 
 
+
+def find_project_container(window) -> tuple[object, object] | tuple[None, None]:
+    """Locate the center pane's project conversation list.
+    It is an AXScrollArea containing an AXOpaqueProviderList.
+    """
+    for _, el in walk_ax(window, max_depth=15):
+        if ax_role(el) != "AXScrollArea":
+            continue
+        f = ax_frame(el)
+        if not f:
+            continue
+        x, y, w, h = f
+        # The center pane is usually wide (> 600px)
+        if w < 500:
+            continue
+        # Look for the AXOpaqueProviderList inside
+        for _, child in walk_ax(el, max_depth=4):
+            if ax_role(child) in ("AXList", "AXOpaqueProviderGroup"):
+                # Make sure it contains chat buttons
+                for _, btn in walk_ax(child, max_depth=2):
+                    if ax_role(btn) == "AXButton" and ax_attr(btn, "AXDescription"):
+                        return el, child
+    return None, None
+
+def list_project_buttons(
+    collection_list,
+    viewport: tuple[float, float, float, float] | None = None,
+) -> list[tuple[int, object, tuple[float, float, float, float], str]]:
+    """Return project conversation buttons from the center pane."""
+    if collection_list is None:
+        return []
+    list_frame = ax_frame(collection_list)
+    list_y = list_frame[1] if list_frame else 0.0
+
+    candidates = []
+    for _, el in walk_ax(collection_list, max_depth=5):
+        if ax_role(el) != "AXButton":
+            continue
+        f = ax_frame(el)
+        if not f:
+            continue
+        x, y, w, h = f
+        desc = (ax_attr(el, "AXDescription") or "").strip()
+        rel_y = int(round(y - list_y))
+        
+        if not desc:
+            continue
+        # Project buttons are wide (e.g. 693x65)
+        if w < 300 or h < 30:
+            continue
+            
+        if viewport is not None:
+            vx, vy, vw, vh = viewport
+            if not (y >= vy - 2 and (y + h) <= (vy + vh) + 2
+                    and x >= vx - 2 and (x + w) <= (vx + vw) + 2):
+                continue
+        candidates.append((rel_y, el, (x, y, w, h), desc))
+
+    candidates.sort(key=lambda r: r[0])
+    return candidates
+
 def find_sidebar_container(window) -> tuple[object, object] | tuple[None, None]:
     """Locate the sidebar's AXScrollArea and its inner AXList (collection).
 
@@ -1675,12 +1736,12 @@ def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> 
     if window is None:
         raise RuntimeError("No ChatGPT window found.")
 
-    scroll_area, collection = find_sidebar_container(window)
+    scroll_area, collection = find_project_container(window)
     if scroll_area is None or collection is None:
-        raise RuntimeError("Could not locate sidebar scroll area / collection list.")
+        raise RuntimeError("Could not locate the project conversation list in the center pane. Make sure the project is open.")
     sa_frame = ax_frame(scroll_area)
     if sa_frame is None:
-        raise RuntimeError("Sidebar scroll area has no frame.")
+        raise RuntimeError("Project scroll area has no frame.")
 
     done_ids: set[str] = set(state.get("project_done", []))
     only_failed = bool(getattr(args, "retry_failed", False))
@@ -1702,9 +1763,9 @@ def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> 
 
     while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
         live_sa_frame = ax_frame(scroll_area) or sa_frame
-        buttons = list_sidebar_buttons(collection, viewport=live_sa_frame)
+        buttons = list_project_buttons(collection, viewport=live_sa_frame)
         
-        unseen = [b for b in buttons if (b[3], b[0]) not in visited and b[3] not in ("See less", "See more", "Back", "New chat", "ChatGPT", "GPTs", "New project", "Library", "Sora")]
+        unseen = [b for b in buttons if (b[3], b[0]) not in visited]
 
         if not unseen:
             _scroll_sidebar(sa_frame, -SIDEBAR_STEP_LINES)
@@ -1743,6 +1804,36 @@ def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> 
         if ok:
             state.setdefault("project_done", []).append(cid)
             save_checkpoint(state)
+            
+        # CRITICAL: Return back to the project list view before the next iteration
+        # In a project, clicking a chat opens it in the center. We must click the "Back" button
+        # or press the escape sequence to return to the project dashboard.
+        # It seems pressing the sidebar project button again is the safest way to return to the dashboard.
+        _press_home_button(pid) # Try home button first
+        time.sleep(1.0)
+        
+        # We need to find the specific project button in the sidebar and click it to go back.
+        # But actually, clicking the project name in the left sidebar again brings us back.
+        app = AXUIElementCreateApplication(pid)
+        window = ax_attr(app, kAXFocusedWindowAttribute)
+        if window is None:
+            wins = ax_attr(app, kAXWindowsAttribute)
+            window = wins[0] if wins else None
+        sidebar_scroll, sidebar_col = find_sidebar_container(window)
+        if sidebar_col:
+            # We don't know the exact project name easily, but it's currently selected or visible.
+            # Let's just find the first visible project button and click it? No, wait. 
+            # In the dump you provided, the left sidebar still has "Product Strategy Prep" visible.
+            for _, el in walk_ax(sidebar_col, max_depth=5):
+                if ax_role(el) == "AXButton":
+                    d = ax_attr(el, "AXDescription")
+                    if d and "Prep" in str(d): # Rough heuristic to click back
+                        AXUIElementPerformAction(el, kAXPressAction)
+                        break
+        time.sleep(1.0)
+        
+        # We must re-find the project container after returning
+        scroll_area, collection = find_project_container(window)
 
         stuck = 0
 
