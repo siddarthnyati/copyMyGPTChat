@@ -494,6 +494,9 @@ def enumerate_conversations(pid: int) -> list[Conversation]:
 
 # -------------------- Message pane location --------------------
 def _get_window(pid: int):
+    """Return ChatGPT's *focused* window. This can be a modal dialog
+    ('Edit project', 'Rename', 'Share', etc.) if one is open. Prefer
+    ``_find_main_window`` when you want the sidebar/chat window."""
     app = AXUIElementCreateApplication(pid)
     window = ax_attr(app, kAXFocusedWindowAttribute)
     if window is None:
@@ -501,6 +504,78 @@ def _get_window(pid: int):
         if wins:
             window = wins[0]
     return window
+
+
+def _find_main_window(pid: int):
+    """Return the main ChatGPT chat window — the one that contains the
+    sidebar scroll area. Bypasses modal dialogs (e.g. 'Edit project')
+    that would otherwise be picked up by ``kAXFocusedWindowAttribute``.
+
+    When a modal is open and we sample the focused window's title, every
+    signature reads as "win:Edit project" regardless of which chat is
+    actually underneath. That makes the verifier think no click ever
+    switches — because, from a focused-window perspective, the modal
+    never goes away. Using the main window (whose title *does* update
+    per chat) unblocks that.
+    """
+    app = AXUIElementCreateApplication(pid)
+    wins = ax_attr(app, kAXWindowsAttribute) or []
+    for w in wins:
+        sa, _coll = find_sidebar_container(w)
+        if sa is not None:
+            return w
+    # Fallback: whatever's focused, or the first window.
+    focused = ax_attr(app, kAXFocusedWindowAttribute)
+    if focused is not None:
+        return focused
+    return wins[0] if wins else None
+
+
+# Window titles that almost always belong to modal dialogs layered
+# over the main ChatGPT window. When the top window has one of these
+# titles, the sidebar is unclickable until the modal is dismissed.
+_MODAL_WINDOW_TITLES = {
+    "Edit project",
+    "New project",
+    "Rename",
+    "Share",
+    "Share link",
+    "Settings",
+    "Delete",
+    "Archive",
+}
+
+
+def _dismiss_modal_if_present(pid: int) -> bool:
+    """If the focused window is a known modal dialog, press Escape to
+    dismiss it. Returns True if a modal was seen and an Escape was
+    attempted. Safe to call at startup and between rows.
+
+    ChatGPT's sidebar buttons accept ``AXPress`` even while a modal is
+    open (so the press reports err=0) but the press is a no-op — the
+    main chat view never updates. Auto-dismissing the modal is the
+    difference between 10/10 rows failing and 10/10 rows working.
+    """
+    window = _get_window(pid)
+    if window is None:
+        return False
+    title = ax_attr(window, kAXTitleAttribute)
+    if not isinstance(title, str):
+        return False
+    t = title.strip()
+    if t in _MODAL_WINDOW_TITLES:
+        log.warning(
+            "Modal dialog '%s' is frontmost in ChatGPT.app; sending Escape "
+            "to dismiss it so sidebar clicks can switch chats.", t,
+        )
+        osa_key_code(KEY_ESCAPE)
+        time.sleep(0.4)
+        # Second Escape in case the modal has nested focus (e.g. a
+        # text field caught the first keypress rather than the dialog).
+        osa_key_code(KEY_ESCAPE)
+        time.sleep(0.4)
+        return True
+    return False
 
 
 def find_message_pane(pid: int) -> tuple[
@@ -513,7 +588,9 @@ def find_message_pane(pid: int) -> tuple[
     The collection list contains AXGroup children, each with AXStaticText
     descendants carrying the rendered message text in AXDescription.
     """
-    window = _get_window(pid)
+    # Use the main chat window, not whichever is focused — avoids
+    # returning None just because a modal dialog is currently topmost.
+    window = _find_main_window(pid)
     if window is None:
         return None, None, None
 
@@ -1002,17 +1079,17 @@ def _pane_signature(pid: int) -> str:
          strongly preferred.
       3. Fall back to the empty string only if everything else fails.
     """
-    window = _get_window(pid)
+    # Prefer the main chat window over whatever is focused — a modal
+    # dialog (e.g. "Edit project") would otherwise poison every sig
+    # with its own static title.
+    window = _find_main_window(pid)
     if window is not None:
         title = ax_attr(window, kAXTitleAttribute)
         if isinstance(title, str):
             t = title.strip()
             if t and t not in _GENERIC_WINDOW_TITLES:
                 return f"win:{t}"
-            # Useful when debugging: note that we fell through because
-            # the title was generic. Helps explain "why is every sig
-            # starting with fb:…" in the logs.
-            log.debug("pane_sig: window title is generic (%r); using content fallback", t)
+            log.debug("pane_sig: main-window title is generic (%r); using content fallback", t)
 
     _pane_frame, _pane_sa, msg_list = find_message_pane(pid)
     if msg_list is None:
@@ -1270,12 +1347,22 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
     only_failed = bool(args.retry_failed)
     failed_ids: set[str] = getattr(args, "_retry_cids", set()) if only_failed else set()
 
+    # Dismiss any modal dialog ('Edit project' etc.) before enumerating.
+    # If one is frontmost, sidebar AXPress returns err=0 but the press
+    # is silently ignored — every row would read as failed.
+    _dismiss_modal_if_present(pid)
+    activate_chatgpt(sleep=0.3)
+
     _sidebar_scroll_to_top(sa_frame)
 
     visited: set[tuple[str, int]] = set()
     content_hashes: set[str] = set()
     processed_count = 0
     limit = args.limit if args.limit else 10**9
+    # Tracks how many rows in a row have failed verification. If this
+    # crosses a threshold, it's almost always a modal that re-appeared
+    # mid-run (e.g. a confirmation dialog) — dismiss and continue.
+    consecutive_failures = 0
 
     # Seed the pane signature from whatever chat is open right now.
     current_sig = _pane_signature(pid)
@@ -1336,6 +1423,21 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
         processed_count += 1
         progress.update(1)
         progress.set_description_str(f"{'ok ' if ok else 'ERR'} {title[:40]}")
+
+        if ok:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            # Two failures in a row is a strong signal a modal popped
+            # up mid-run. Escape it and continue; costs nothing when
+            # no modal is present.
+            if consecutive_failures >= 2:
+                log.warning(
+                    "%d consecutive failures — checking for a modal and "
+                    "re-activating ChatGPT.", consecutive_failures,
+                )
+                _dismiss_modal_if_present(pid)
+                activate_chatgpt(sleep=0.2)
 
         # Spot-check every 5 processed rows. The bug we're guarding
         # against: every file ends up with the SAME content because
