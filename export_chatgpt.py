@@ -109,13 +109,15 @@ def find_chatgpt_pid() -> int | None:
     return None
 
 
-def activate_chatgpt() -> None:
+def activate_chatgpt(sleep: float = 0.6) -> None:
+    """Raise ChatGPT.app to the front. Cheap when already frontmost —
+    Apple Events returns immediately if no activation is needed."""
     subprocess.run(
         ["osascript", "-e", 'tell application "ChatGPT" to activate'],
         check=False,
         capture_output=True,
     )
-    time.sleep(0.6)
+    time.sleep(sleep)
 
 
 def check_accessibility() -> bool:
@@ -1007,6 +1009,10 @@ def _pane_signature(pid: int) -> str:
             t = title.strip()
             if t and t not in _GENERIC_WINDOW_TITLES:
                 return f"win:{t}"
+            # Useful when debugging: note that we fell through because
+            # the title was generic. Helps explain "why is every sig
+            # starting with fb:…" in the logs.
+            log.debug("pane_sig: window title is generic (%r); using content fallback", t)
 
     _pane_frame, _pane_sa, msg_list = find_message_pane(pid)
     if msg_list is None:
@@ -1077,31 +1083,55 @@ def _click_row_verified(
     title: str,
     prev_sig: str,
 ) -> tuple[bool, str]:
-    """Click the row and confirm the message pane actually changed.
+    """Press the row and confirm the message pane actually changed.
 
-    Strategy:
-      1. cg_click on the live frame center.
-      2. Poll pane signature for up to _CLICK_VERIFY_TIMEOUT seconds.
-      3. If unchanged, retry once with a slight cursor jitter + click.
-      4. If still unchanged, try AXPress as a last resort.
-      5. Return (switched, new_sig).
+    Strategy, in order (fastest and most reliable first):
+      1. ``AXUIElementPerformAction(ax_ref, kAXPressAction)``. This fires
+         the button's press handler directly inside the ChatGPT process
+         — no cursor, no focus, no CGEventTap. It works even if another
+         app is frontmost or if the cursor was just nudged onto a
+         secondary display.
+      2. Raise ChatGPT to the front, then a plain ``cg_click`` on the
+         frame center. Activation guarantees the click is delivered to
+         the sidebar rather than to whatever window happens to be under
+         the cursor.
+      3. Cursor-jitter + ``cg_click``. Some SwiftUI button hit-tests
+         ignore a click when the cursor was already inside the button's
+         rect at click-down; nudging forces a fresh enter/exit cycle.
+
+    After each attempt we poll ``_pane_signature`` for up to
+    _CLICK_VERIFY_TIMEOUT seconds and consider the row opened only if
+    the sig changes to a non-empty value.
     """
     x, y, w, h = frame
     cx, cy = x + w / 2, y + h / 2
 
-    # Attempt 1: plain click.
+    # Attempt 1: AXPress. Focus-independent, cursor-independent.
+    err = AXUIElementPerformAction(ax_ref, kAXPressAction)
+    log.info("  AXPress '%s' err=%s", title, err)
+    if err == 0:
+        switched, sig = _verify_click_switched(
+            pid, prev_sig, time.time() + _CLICK_VERIFY_TIMEOUT
+        )
+        if switched:
+            log.info("  switched via AXPress -> sig=%s", sig)
+            return True, sig
+
+    # Attempt 2: re-activate ChatGPT, then plain click.
+    log.warning("  AXPress did not switch '%s'; activating ChatGPT + cg_click", title)
+    activate_chatgpt()
+    time.sleep(0.15)
     cg_click(cx, cy)
     time.sleep(0.25)
     switched, sig = _verify_click_switched(
         pid, prev_sig, time.time() + _CLICK_VERIFY_TIMEOUT
     )
     if switched:
+        log.info("  switched via cg_click -> sig=%s", sig)
         return True, sig
 
-    # Attempt 2: cursor jitter + click. Some SwiftUI button hit-tests
-    # ignore a click when the cursor was already inside the button's rect
-    # at click-down; nudging first forces a fresh enter/exit cycle.
-    log.warning("Click did not switch chat '%s' on first try; retrying", title)
+    # Attempt 3: cursor jitter + click.
+    log.warning("  cg_click did not switch '%s'; jitter + retry", title)
     cg_move(cx - 8, cy - 3)
     time.sleep(0.08)
     cg_move(cx, cy)
@@ -1111,15 +1141,15 @@ def _click_row_verified(
         pid, prev_sig, time.time() + _CLICK_VERIFY_TIMEOUT
     )
     if switched:
+        log.info("  switched via jitter+click -> sig=%s", sig)
         return True, sig
 
-    # Attempt 3: AXPress.
-    log.warning("Second click still did not switch '%s'; trying AXPress", title)
-    AXUIElementPerformAction(ax_ref, kAXPressAction)
-    switched, sig = _verify_click_switched(
-        pid, prev_sig, time.time() + _CLICK_VERIFY_TIMEOUT
+    log.error(
+        "  ALL three attempts failed for '%s'. prev_sig=%s final_sig=%s "
+        "ChatGPT likely not frontmost or the sidebar row AXRef is dead.",
+        title, prev_sig, sig,
     )
-    return switched, sig
+    return False, sig
 
 
 def _process_one_row(
@@ -1280,6 +1310,11 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
             if cid in done_ids:
                 stuck = 0
                 continue
+
+        # Cheap re-activation — guarantees ChatGPT is frontmost so the
+        # click goes to it rather than to whatever window happens to be
+        # under the cursor. Apple Events no-ops when already frontmost.
+        activate_chatgpt(sleep=0.1)
 
         # Resample sig RIGHT NOW so the verifier compares against the
         # actual current state of the pane (not the post-click sig from
