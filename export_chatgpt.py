@@ -1664,12 +1664,100 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
 
 
 # -------------------- Main --------------------
+
+def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> int:
+    """Walk the project's internal conversation list."""
+    app = AXUIElementCreateApplication(pid)
+    window = ax_attr(app, kAXFocusedWindowAttribute)
+    if window is None:
+        wins = ax_attr(app, kAXWindowsAttribute)
+        window = wins[0] if wins else None
+    if window is None:
+        raise RuntimeError("No ChatGPT window found.")
+
+    scroll_area, collection = find_sidebar_container(window)
+    if scroll_area is None or collection is None:
+        raise RuntimeError("Could not locate sidebar scroll area / collection list.")
+    sa_frame = ax_frame(scroll_area)
+    if sa_frame is None:
+        raise RuntimeError("Sidebar scroll area has no frame.")
+
+    done_ids: set[str] = set(state.get("project_done", []))
+    only_failed = bool(getattr(args, "retry_failed", False))
+    failed_ids: set[str] = getattr(args, "_retry_cids", set()) if only_failed else set()
+
+    activate_chatgpt(sleep=0.3)
+    _sidebar_scroll_to_top(sa_frame)
+
+    visited: set[tuple[str, int]] = set()
+    content_hashes: set[str] = set()
+    processed_count = 0
+    limit = args.limit if args.limit else 10**9
+
+    current_sig = _pane_signature(pid)
+    log.info("Initial pane signature: %s", current_sig)
+
+    stuck = 0
+    progress = tqdm(unit="conv")
+
+    while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
+        live_sa_frame = ax_frame(scroll_area) or sa_frame
+        buttons = list_sidebar_buttons(collection, viewport=live_sa_frame)
+        
+        unseen = [b for b in buttons if (b[3], b[0]) not in visited and b[3] not in ("See less", "See more", "Back", "New chat", "ChatGPT", "GPTs", "New project", "Library", "Sora")]
+
+        if not unseen:
+            _scroll_sidebar(sa_frame, -SIDEBAR_STEP_LINES)
+            time.sleep(0.3)
+            stuck += 1
+            continue
+
+        rel_y, ax_ref, frame, title = unseen[0]
+        key = (title, rel_y)
+        visited.add(key)
+
+        cid = hashlib.sha1(f"proj_{title}@{rel_y}".encode()).hexdigest()[:16]
+        if only_failed:
+            if cid not in failed_ids:
+                stuck = 0
+                continue
+        else:
+            if cid in done_ids:
+                stuck = 0
+                continue
+
+        activate_chatgpt(sleep=0.1)
+        live_sig = _pane_signature(pid)
+        log.info("--> Click project row #%d '%s'", processed_count + 1, title)
+
+        ok, msg, current_sig = _process_one_row(
+            pid, rel_y, frame, ax_ref, title,
+            processed_count, state, args.delay,
+            live_sig, content_hashes,
+        )
+        
+        processed_count += 1
+        progress.update(1)
+        progress.set_description_str(f"{'ok ' if ok else 'ERR'} {title[:40]}")
+
+        if ok:
+            state.setdefault("project_done", []).append(cid)
+            save_checkpoint(state)
+
+        stuck = 0
+
+    progress.close()
+    n_done = len(state.get("project_done", []))
+    print(f"\nProject Walk complete: visited {processed_count} new row(s); {n_done} total exported.")
+    return 0
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Export ChatGPT conversations from macOS app.")
     ap.add_argument("--dry-run", action="store_true", help="Enumerate only; don't open or save.")
     ap.add_argument("--limit", type=int, default=0, help="Export at most N conversations.")
     ap.add_argument("--retry-failed", action="store_true", help="Only retry previously failed ones.")
     ap.add_argument("--debug", action="store_true", help="Dump AX tree to .ax_dump.txt.")
+    ap.add_argument("--project", action="store_true", help="Export conversations from an open project.")
     ap.add_argument("--delay", type=float, default=INTER_CONV_DELAY,
                     help="Seconds between conversations.")
     return ap.parse_args()
@@ -1681,6 +1769,27 @@ def main() -> int:
     global log
     log = setup_logging()
 
+    if not (args.dry_run or getattr(args, 'limit', 0) or getattr(args, 'retry_failed', False) or getattr(args, 'project', False)):
+        print("\n" + "=" * 50)
+        print("  ChatGPT Desktop Exporter")
+        print("=" * 50)
+        print("This tool uses macOS Accessibility to physically click and scroll")
+        print("through your conversations, exporting them to ~/chatgpt_exports/\n")
+        print("Choose an option:")
+        print("  1. Export all main sidebar conversations")
+        print("  2. Export conversations from an OPEN project")
+        print("  3. Exit")
+        choice = ""
+        while choice not in ("1", "2", "3"):
+            try:
+                choice = input("\nEnter your choice (1/2/3): ").strip()
+            except EOFError:
+                return 1
+        if choice == "3":
+            return 0
+        elif choice == "2":
+            args.project = True
+            
     if not check_accessibility():
         print(
             "ERROR: macOS Accessibility permission is not granted.\n"
@@ -1737,7 +1846,10 @@ def main() -> int:
     time.sleep(2.0)
 
     try:
-        walk_and_export(pid, state, args)
+        if getattr(args, 'project', False):
+            walk_and_export_project(pid, state, args)
+        else:
+            walk_and_export(pid, state, args)
         
         # Automatically retry failed conversations once at the end
         if not getattr(args, 'retry_failed', False) and state.get('failed'):
@@ -1748,7 +1860,10 @@ def main() -> int:
             args._retry_cids = {f['id'] for f in state.get('failed', [])}
             state['failed'] = []
             # Run the walk again
-            walk_and_export(pid, state, args)
+            if getattr(args, 'project', False):
+                walk_and_export_project(pid, state, args)
+            else:
+                walk_and_export(pid, state, args)
 
     except KeyboardInterrupt:
         save_checkpoint(state)
