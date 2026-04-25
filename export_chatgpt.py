@@ -1738,6 +1738,18 @@ def main() -> int:
 
     try:
         walk_and_export(pid, state, args)
+        
+        # Automatically retry failed conversations once at the end
+        if not getattr(args, 'retry_failed', False) and state.get('failed'):
+            n_failed = len(state.get('failed'))
+            print(f"\n*** First pass complete. Automatically retrying {n_failed} failed conversation(s)... ***")
+            # Set up for a retry pass
+            args.retry_failed = True
+            args._retry_cids = {f['id'] for f in state.get('failed', [])}
+            state['failed'] = []
+            # Run the walk again
+            walk_and_export(pid, state, args)
+
     except KeyboardInterrupt:
         save_checkpoint(state)
         print("\nInterrupted. Re-run the script to resume from checkpoint.")
