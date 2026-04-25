@@ -507,28 +507,55 @@ def _get_window(pid: int):
 
 
 def _find_main_window(pid: int):
-    """Return the main ChatGPT chat window — the one that contains the
-    sidebar scroll area. Bypasses modal dialogs (e.g. 'Edit project')
-    that would otherwise be picked up by ``kAXFocusedWindowAttribute``.
-
-    When a modal is open and we sample the focused window's title, every
-    signature reads as "win:Edit project" regardless of which chat is
-    actually underneath. That makes the verifier think no click ever
-    switches — because, from a focused-window perspective, the modal
-    never goes away. Using the main window (whose title *does* update
-    per chat) unblocks that.
+    """Return the main ChatGPT chat window — the one containing the
+    sidebar scroll area. If several windows qualify (e.g. a standalone
+    'Edit project' window AND the main chat window), prefer the one
+    whose title is NOT in _VIEW_MODE_TITLES. This distinction matters
+    when multiple ChatGPT windows are open: we want the chat window,
+    not the project-edit one.
     """
     app = AXUIElementCreateApplication(pid)
     wins = ax_attr(app, kAXWindowsAttribute) or []
+    chat_win = None
+    any_sidebar_win = None
     for w in wins:
         sa, _coll = find_sidebar_container(w)
-        if sa is not None:
-            return w
-    # Fallback: whatever's focused, or the first window.
+        if sa is None:
+            continue
+        if any_sidebar_win is None:
+            any_sidebar_win = w
+        title = ax_attr(w, kAXTitleAttribute)
+        t = title.strip() if isinstance(title, str) else ""
+        if t not in _VIEW_MODE_TITLES:
+            chat_win = w
+            break
+    if chat_win is not None:
+        return chat_win
+    if any_sidebar_win is not None:
+        return any_sidebar_win
     focused = ax_attr(app, kAXFocusedWindowAttribute)
     if focused is not None:
         return focused
     return wins[0] if wins else None
+
+
+def _log_windows(pid: int) -> None:
+    """Dump every window's title + has-sidebar flag to the log. Exactly
+    what you want to see when clicks stop working — tells you whether
+    there are extra windows (Edit project, Settings, ...) that need
+    closing, and which one we'll pick as 'main'."""
+    app = AXUIElementCreateApplication(pid)
+    wins = ax_attr(app, kAXWindowsAttribute) or []
+    focused = ax_attr(app, kAXFocusedWindowAttribute)
+    log.info("ChatGPT has %d window(s):", len(wins))
+    for i, w in enumerate(wins):
+        t = ax_attr(w, kAXTitleAttribute) or ""
+        sa, _c = find_sidebar_container(w)
+        marker = " [FOCUSED]" if w is focused else ""
+        log.info(
+            "  window #%d title=%r has_sidebar=%s%s",
+            i, t, sa is not None, marker,
+        )
 
 
 # Titles that mean ChatGPT.app is in a non-chat *view mode*. Escape
@@ -559,28 +586,57 @@ _MODAL_WINDOW_TITLES = {
 
 
 def _press_home_button(pid: int) -> bool:
-    """Find and AXPress the sidebar's "ChatGPT" home button.
-
-    This is the app-logo button at the top of the sidebar that returns
-    the main pane to a fresh new-chat view. It is the reliable way to
-    exit non-chat views like "Edit project" or "Library" — Escape does
-    not dismiss those because they are view modes, not modal dialogs.
+    """Find the sidebar's "ChatGPT" home button and press it via both
+    AXPress AND a real cg_click. SwiftUI sometimes reports AXPress
+    success (err=0) without firing the button handler, so we follow up
+    with a genuine synthesized click at the button's frame center.
     """
-    window = _find_main_window(pid) or _get_window(pid)
-    if window is None:
+    # Search all windows — the home button lives in the main chat
+    # window's sidebar, but if we're currently inspecting the Edit
+    # Project window, searching only it would miss it.
+    app = AXUIElementCreateApplication(pid)
+    wins = ax_attr(app, kAXWindowsAttribute) or []
+    home_el = None
+    home_frame: tuple[float, float, float, float] | None = None
+    for w in wins:
+        scroll_area, _coll = find_sidebar_container(w)
+        root = scroll_area if scroll_area is not None else w
+        for _, el in walk_ax(root, max_depth=14):
+            if ax_role(el) != "AXButton":
+                continue
+            desc = (ax_attr(el, "AXDescription") or "").strip()
+            if desc == "ChatGPT":
+                home_el = el
+                home_frame = ax_frame(el)
+                break
+        if home_el is not None:
+            break
+    if home_el is None:
+        log.warning("Could not locate 'ChatGPT' home button in any window")
         return False
-    scroll_area, _coll = find_sidebar_container(window)
-    root = scroll_area if scroll_area is not None else window
-    for _, el in walk_ax(root, max_depth=14):
-        if ax_role(el) != "AXButton":
-            continue
-        desc = (ax_attr(el, "AXDescription") or "").strip()
-        if desc == "ChatGPT":
-            err = AXUIElementPerformAction(el, kAXPressAction)
-            log.info("AXPress 'ChatGPT' home button: err=%s", err)
-            return err == 0
-    log.warning("Could not locate 'ChatGPT' home button in sidebar")
-    return False
+
+    err = AXUIElementPerformAction(home_el, kAXPressAction)
+    log.info("AXPress 'ChatGPT' home button: err=%s frame=%s", err, home_frame)
+    # Follow up with a real click regardless of AXPress result. SwiftUI
+    # buttons often silently ignore AXPress.
+    if home_frame is not None:
+        activate_chatgpt(sleep=0.15)
+        x, y, w, h = home_frame
+        cg_click(x + w / 2, y + h / 2)
+        log.info("cg_click 'ChatGPT' home button at (%.0f, %.0f)",
+                 x + w / 2, y + h / 2)
+    return True
+
+
+def _close_window_with_cmd_w(pid: int) -> None:
+    """Send Cmd+W to ChatGPT via System Events. Closes the frontmost
+    window — if that window is 'Edit project', this is the cleanest
+    way to get rid of it and expose the main chat window underneath.
+    """
+    log.info("Sending Cmd+W to close frontmost ChatGPT window")
+    activate_chatgpt(sleep=0.15)
+    osa_cmd_key("w")
+    time.sleep(0.6)
 
 
 def _current_window_title(pid: int) -> str:
@@ -612,36 +668,51 @@ def _dismiss_modal_if_present(pid: int) -> bool:
     if not title:
         return False
 
-    # --- View modes: need the home button, not Escape ---
+    # --- View modes: Escape doesn't exit these. Try, in order:
+    #     1. Cmd+W to close the offending window (if it's separate
+    #        from the main chat window).
+    #     2. The "ChatGPT" sidebar home button, pressed both via
+    #        AXPress and a real cg_click.
+    #     3. Cmd+N to force a brand new chat.
     if title in _VIEW_MODE_TITLES:
-        log.warning(
-            "ChatGPT.app is in '%s' view; pressing sidebar home button "
-            "to return to a chat view.", title,
-        )
-        _press_home_button(pid)
-        time.sleep(0.6)
-        # If it didn't help, also try Cmd+N to force a new chat.
+        log.warning("ChatGPT.app is in '%s' view; attempting recovery.", title)
+        _log_windows(pid)
+
+        # Attempt 1: Cmd+W. If Edit project is a separate window or a
+        # sheet, this closes it outright.
+        _close_window_with_cmd_w(pid)
         after = _current_window_title(pid)
-        if after in _VIEW_MODE_TITLES:
-            log.warning(
-                "Still in '%s' after home-button press; sending Cmd+N "
-                "to open a new chat.", after,
-            )
-            osa_cmd_key("n")
-            time.sleep(0.6)
+        log.info("After Cmd+W: title=%r", after)
+        if after not in _VIEW_MODE_TITLES:
+            return True
+
+        # Attempt 2: press the home button (AXPress + real click).
+        _press_home_button(pid)
+        time.sleep(0.8)
+        after = _current_window_title(pid)
+        log.info("After home-button press: title=%r", after)
+        if after not in _VIEW_MODE_TITLES:
+            return True
+
+        # Attempt 3: Cmd+N.
+        log.warning("Still in '%s'; sending Cmd+N to open a new chat.", after)
+        osa_cmd_key("n")
+        time.sleep(0.8)
         final = _current_window_title(pid)
         log.info("View-mode recovery: before=%r after=%r", title, final)
         if final in _VIEW_MODE_TITLES:
             log.error(
-                "Could not automatically exit '%s' view. "
-                "Manually click the 'ChatGPT' button at the top of "
-                "the sidebar, then re-run the script.",
+                "All automated recovery attempts failed. ChatGPT is "
+                "still in '%s' view. Manually click the 'ChatGPT' "
+                "button at the top of the sidebar (or close the "
+                "current window with Cmd+W), then re-run the script.",
                 final,
             )
             print(
-                f"\n!!! ChatGPT.app is stuck in '{final}' view. Click "
-                f"the 'ChatGPT' button at the top of the sidebar, then "
-                f"re-run.\n", flush=True,
+                f"\n!!! ChatGPT.app is stuck in '{final}' view. Close the "
+                f"Edit-project window (Cmd+W) or click the 'ChatGPT' "
+                f"button at the top of the sidebar, then re-run.\n",
+                flush=True,
             )
         return True
 
@@ -1429,9 +1500,14 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
     only_failed = bool(args.retry_failed)
     failed_ids: set[str] = getattr(args, "_retry_cids", set()) if only_failed else set()
 
-    # Dismiss any modal dialog ('Edit project' etc.) before enumerating.
-    # If one is frontmost, sidebar AXPress returns err=0 but the press
-    # is silently ignored — every row would read as failed.
+    # One-time dump: what windows does ChatGPT.app have right now, and
+    # which one are we picking as "main"? Critical for debugging the
+    # "stuck in Edit project" class of bug.
+    _log_windows(pid)
+
+    # Dismiss any modal or view mode before enumerating. If one is
+    # frontmost, sidebar AXPress returns err=0 but the press is
+    # silently ignored — every row would read as failed.
     _dismiss_modal_if_present(pid)
     activate_chatgpt(sleep=0.3)
 
