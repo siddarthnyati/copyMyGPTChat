@@ -691,6 +691,9 @@ def _dismiss_modal_if_present(pid: int) -> bool:
     # do in one sentence, and refuse to run. One manual click from the
     # user is cheaper than five minutes of failed clicks from us.
     if title in _VIEW_MODE_TITLES:
+        if _has_chat_pane(pid):
+            log.info("ChatGPT.app title is %r but a chat pane is visible. Ignoring stale title.", title)
+            return False
         log.warning("ChatGPT.app is in '%s' view. Dumping window state.", title)
         _log_windows(pid)
 
@@ -1248,7 +1251,7 @@ def _pane_signature(pid: int) -> str:
         title = ax_attr(window, kAXTitleAttribute)
         if isinstance(title, str):
             t = title.strip()
-            if t and t not in _GENERIC_WINDOW_TITLES:
+            if t and t not in _GENERIC_WINDOW_TITLES and t not in _VIEW_MODE_TITLES:
                 return f"win:{t}"
             log.debug("pane_sig: main-window title is generic (%r); using content fallback", t)
 
