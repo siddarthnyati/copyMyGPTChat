@@ -531,50 +531,132 @@ def _find_main_window(pid: int):
     return wins[0] if wins else None
 
 
-# Window titles that almost always belong to modal dialogs layered
-# over the main ChatGPT window. When the top window has one of these
-# titles, the sidebar is unclickable until the modal is dismissed.
-_MODAL_WINDOW_TITLES = {
+# Titles that mean ChatGPT.app is in a non-chat *view mode*. Escape
+# does not exit these — pressing the "ChatGPT" sidebar home button
+# does. This is the state the user was stuck in during the 0/10 runs:
+# the window title was "Edit project" the whole time, sidebar AXPress
+# returned err=0 but pressed into a view that couldn't open a chat.
+_VIEW_MODE_TITLES = {
     "Edit project",
     "New project",
+    "Library",
+    "Sora",
+    "GPTs",
+    "Explore GPTs",
+}
+
+# Titles that belong to genuine modal dialogs layered over the main
+# window. These CAN be dismissed with Escape.
+_MODAL_WINDOW_TITLES = {
     "Rename",
     "Share",
     "Share link",
     "Settings",
     "Delete",
     "Archive",
+    "Confirm",
 }
 
 
-def _dismiss_modal_if_present(pid: int) -> bool:
-    """If the focused window is a known modal dialog, press Escape to
-    dismiss it. Returns True if a modal was seen and an Escape was
-    attempted. Safe to call at startup and between rows.
+def _press_home_button(pid: int) -> bool:
+    """Find and AXPress the sidebar's "ChatGPT" home button.
 
-    ChatGPT's sidebar buttons accept ``AXPress`` even while a modal is
-    open (so the press reports err=0) but the press is a no-op — the
-    main chat view never updates. Auto-dismissing the modal is the
-    difference between 10/10 rows failing and 10/10 rows working.
+    This is the app-logo button at the top of the sidebar that returns
+    the main pane to a fresh new-chat view. It is the reliable way to
+    exit non-chat views like "Edit project" or "Library" — Escape does
+    not dismiss those because they are view modes, not modal dialogs.
     """
-    window = _get_window(pid)
+    window = _find_main_window(pid) or _get_window(pid)
     if window is None:
         return False
-    title = ax_attr(window, kAXTitleAttribute)
-    if not isinstance(title, str):
+    scroll_area, _coll = find_sidebar_container(window)
+    root = scroll_area if scroll_area is not None else window
+    for _, el in walk_ax(root, max_depth=14):
+        if ax_role(el) != "AXButton":
+            continue
+        desc = (ax_attr(el, "AXDescription") or "").strip()
+        if desc == "ChatGPT":
+            err = AXUIElementPerformAction(el, kAXPressAction)
+            log.info("AXPress 'ChatGPT' home button: err=%s", err)
+            return err == 0
+    log.warning("Could not locate 'ChatGPT' home button in sidebar")
+    return False
+
+
+def _current_window_title(pid: int) -> str:
+    """Return the title of whichever ChatGPT window appears most 'main'
+    right now — for diagnostics and view-mode detection."""
+    window = _find_main_window(pid) or _get_window(pid)
+    if window is None:
+        return ""
+    t = ax_attr(window, kAXTitleAttribute)
+    return t.strip() if isinstance(t, str) else ""
+
+
+def _dismiss_modal_if_present(pid: int) -> bool:
+    """Return ChatGPT.app to a state where sidebar clicks switch chats.
+
+    Two distinct stuck-states to recover from:
+
+      * **Modal dialogs** (e.g. a Rename sheet): dismissed by Escape.
+      * **View modes** (e.g. "Edit project", "Library"): Escape does
+        nothing. The fix is to press the sidebar's "ChatGPT" home
+        button, which returns the app to a normal new-chat view.
+
+    Both are identified by inspecting the main window's AXTitle. If it
+    matches one of our known "not a chat" titles, we take the
+    appropriate recovery action and poll for the title to change.
+    Returns True if recovery was attempted (whether or not successful).
+    """
+    title = _current_window_title(pid)
+    if not title:
         return False
-    t = title.strip()
-    if t in _MODAL_WINDOW_TITLES:
+
+    # --- View modes: need the home button, not Escape ---
+    if title in _VIEW_MODE_TITLES:
         log.warning(
-            "Modal dialog '%s' is frontmost in ChatGPT.app; sending Escape "
-            "to dismiss it so sidebar clicks can switch chats.", t,
+            "ChatGPT.app is in '%s' view; pressing sidebar home button "
+            "to return to a chat view.", title,
+        )
+        _press_home_button(pid)
+        time.sleep(0.6)
+        # If it didn't help, also try Cmd+N to force a new chat.
+        after = _current_window_title(pid)
+        if after in _VIEW_MODE_TITLES:
+            log.warning(
+                "Still in '%s' after home-button press; sending Cmd+N "
+                "to open a new chat.", after,
+            )
+            osa_cmd_key("n")
+            time.sleep(0.6)
+        final = _current_window_title(pid)
+        log.info("View-mode recovery: before=%r after=%r", title, final)
+        if final in _VIEW_MODE_TITLES:
+            log.error(
+                "Could not automatically exit '%s' view. "
+                "Manually click the 'ChatGPT' button at the top of "
+                "the sidebar, then re-run the script.",
+                final,
+            )
+            print(
+                f"\n!!! ChatGPT.app is stuck in '{final}' view. Click "
+                f"the 'ChatGPT' button at the top of the sidebar, then "
+                f"re-run.\n", flush=True,
+            )
+        return True
+
+    # --- True modal dialogs: Escape usually dismisses them ---
+    if title in _MODAL_WINDOW_TITLES:
+        log.warning(
+            "Modal dialog '%s' is frontmost; sending Escape to dismiss it.",
+            title,
         )
         osa_key_code(KEY_ESCAPE)
         time.sleep(0.4)
-        # Second Escape in case the modal has nested focus (e.g. a
-        # text field caught the first keypress rather than the dialog).
         osa_key_code(KEY_ESCAPE)
         time.sleep(0.4)
         return True
+
     return False
 
 
