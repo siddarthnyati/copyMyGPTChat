@@ -984,6 +984,7 @@ def extract_messages_from_ax(
     time.sleep(0.12)
 
     # Jump to the very top.
+    cg_move(center_x, center_y)
     osa_key_code(KEY_HOME)
     time.sleep(0.9)
 
@@ -998,6 +999,7 @@ def extract_messages_from_ax(
                 order_ref[0] += 1
                 added += 1
         total_chars = sum(len(c.desc) for c in store)
+        print(f"\r      ↳ Scrolling... extracted {total_chars} chars across {len(store)} blocks   ", end="", flush=True)
         top = _first_text_y(msg_list)
         log.info(
             "Extract %-18s ax_nodes=%3d captures=%3d chars=%6d (+%d) top_y=%s",
@@ -1024,7 +1026,7 @@ def extract_messages_from_ax(
     prev_total_chars = 0
 
     for step in range(MAX_PAGE_DOWNS):
-        osa_key_code(KEY_PAGE_DOWN)
+        cg_scroll(-15)
         time.sleep(0.45)
         _capture(f"pgdn#{step + 1:02d}")
         # Second capture after a short settle — lets virtualization mount
@@ -1070,6 +1072,7 @@ def extract_messages_from_ax(
         label = _classify(c.x, px, pw)
         blocks.append((label, c.desc))
 
+    print(" " * 80 + "\r", end="", flush=True)
     return _coalesce_blocks(blocks)
 
 
