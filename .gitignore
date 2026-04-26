@@ -1,4 +1,24 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+
+# macOS
 .DS_Store
+.AppleDouble
+
+# Export output — never commit your own chat data
+chatgpt_exports/
+*.checkpoint.json
+
+# Scratch / dev scripts not part of the published tool
+copyMyGPTChat/
+patch*.py
+patch.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
