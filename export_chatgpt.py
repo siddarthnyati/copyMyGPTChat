@@ -27,7 +27,16 @@ from pathlib import Path
 from typing import Iterable
 
 import pyautogui
-from tqdm import tqdm
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.table import Table
+from rich import box
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TaskProgressColumn
+import questionary
+
+console = Console()
 
 from ApplicationServices import (  # type: ignore
     AXIsProcessTrusted,
@@ -96,6 +105,67 @@ def setup_logging() -> logging.Logger:
 log = logging.getLogger("chatgpt_export")
 
 
+# -------------------- TUI helpers --------------------
+def print_welcome() -> None:
+    title = Text()
+    title.append("  copyMyGPTChat  ", style="bold white on dark_orange")
+    console.print()
+    console.print(Panel(
+        title,
+        subtitle="[dim]macOS ChatGPT Desktop Exporter[/dim]",
+        border_style="orange1",
+        padding=(0, 2),
+    ))
+    console.print(
+        "  Uses macOS [bold]Accessibility API[/bold] to walk your sidebar and extract every conversation.\n"
+        f"  Output → [bold cyan]{OUTPUT_DIR}[/bold cyan]\n",
+        style="dim",
+    )
+
+
+def preflight_check() -> tuple[bool, int | None]:
+    """Run pre-flight checks and return (ok, pid). Prints styled status."""
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    table.add_column(justify="right", style="bold", width=4)
+    table.add_column()
+    table.add_column()
+
+    ax_ok = check_accessibility()
+    pid = find_chatgpt_pid()
+    app_ok = pid is not None
+
+    table.add_row(
+        "[green]✓[/green]" if ax_ok else "[red]✗[/red]",
+        "Accessibility permission",
+        "[green]granted[/green]" if ax_ok else "[red]missing[/red]",
+    )
+    table.add_row(
+        "[green]✓[/green]" if app_ok else "[red]✗[/red]",
+        "ChatGPT.app",
+        "[green]running[/green]" if app_ok else "[red]not found[/red]",
+    )
+    console.print(Panel(table, title="[bold]Pre-flight[/bold]", border_style="bright_black"))
+
+    if not ax_ok:
+        console.print(Panel(
+            "[bold yellow]How to grant Accessibility permission:[/bold yellow]\n\n"
+            "  1. Open [bold]System Settings[/bold]\n"
+            "  2. Go to [bold]Privacy & Security → Accessibility[/bold]\n"
+            "  3. Click [bold]+[/bold] and add your terminal (Terminal.app, iTerm2, VS Code…)\n"
+            "  4. Toggle it [bold green]ON[/bold green], then re-run this script.",
+            title="[bold red]Permission Required[/bold red]",
+            border_style="red",
+        ))
+
+    if not app_ok:
+        console.print(
+            "[red]  ChatGPT.app is not running.[/red] "
+            "Open it, log in, and make sure the sidebar is visible, then re-run.\n"
+        )
+
+    return ax_ok and app_ok, pid
+
+
 # -------------------- macOS helpers --------------------
 def find_chatgpt_pid() -> int | None:
     ws = NSWorkspace.sharedWorkspace()
@@ -122,6 +192,23 @@ def activate_chatgpt(sleep: float = 0.6) -> None:
 
 def check_accessibility() -> bool:
     return bool(AXIsProcessTrusted())
+
+
+def _chatgpt_is_frontmost() -> bool:
+    """True iff ChatGPT.app is currently the frontmost (active) application.
+
+    Raw Quartz mouse/scroll events (cg_click, cg_scroll) are delivered to
+    whichever window is under the cursor — not to a specific PID. If VS Code,
+    Safari, or any other app is frontmost when we fire those events, the input
+    lands on the wrong app. This check gates every Quartz event so we never
+    accidentally scroll VS Code or any other open window.
+    """
+    front = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if front is None:
+        return False
+    bid = front.bundleIdentifier() or ""
+    name = front.localizedName() or ""
+    return bid in APP_BUNDLE_IDS or name in APP_NAME_FALLBACKS
 
 
 # -------------------- Low-level input (bypasses pyautogui failsafe) --------------------
@@ -333,34 +420,91 @@ class Conversation:
 
 
 
-def find_project_container(window) -> tuple[object, object] | tuple[None, None]:
-    """Locate the center pane's project conversation list.
-    It is an AXScrollArea containing an AXOpaqueProviderList.
+# Project conversation cards are always AXButton in the ChatGPT project pane.
+# AXGroup/AXStaticText appear in the *message pane* (chat content) — explicitly
+# excluded so a just-opened conversation's message bubbles are never mistaken
+# for project row buttons.
+_PROJECT_CONTAINER_ROLES = {"AXList", "AXOpaqueProviderGroup", "AXTable"}
+
+
+def _item_title(el) -> str:
+    """Best-effort title for a project conversation card (AXButton).
+
+    ChatGPT encodes each card as an AXButton with AXDescription =
+    "Chat Title, Preview snippet…".  Split at the first ", " to return
+    only the clean title portion.
     """
-    for _, el in walk_ax(window, max_depth=15):
+    desc = (ax_attr(el, "AXDescription") or "").strip()
+    if desc:
+        idx = desc.find(", ")
+        return desc[:idx].strip() if idx > 3 else desc
+    return (ax_attr(el, kAXTitleAttribute) or "").strip()
+
+
+def find_project_container(window) -> tuple[object, object] | tuple[None, None]:
+    """Locate the project conversation list in the center pane.
+
+    Key constraints that prevent false matches after a conversation is opened:
+
+    1. The scroll area must be on-screen (y >= 50).  When a conversation is
+       open the project list scroll area scrolls off the top and its y goes
+       negative; filtering y < 50 removes it.
+    2. Items must be AXButton — project cards are buttons.  Message-pane
+       content uses AXGroup / AXStaticText; we never accept those.
+    3. Prefer higher-y scroll areas (the list sits BELOW the Chats/Sources
+       tab switcher; the message pane header sits above it).
+    """
+    scroll_candidates: list[tuple[float, float, object]] = []
+    for _, el in walk_ax(window, max_depth=20):
         if ax_role(el) != "AXScrollArea":
             continue
         f = ax_frame(el)
         if not f:
             continue
-        x, y, w, h = f
-        # The center pane is usually wide (> 600px)
-        if w < 500:
+        x, y, w, _ = f
+        # Must be wide (not sidebar), right of sidebar, and on-screen.
+        if w < 400 or x < 200 or y < 50:
             continue
-        # Look for the AXOpaqueProviderList inside
-        for _, child in walk_ax(el, max_depth=4):
-            if ax_role(child) in ("AXList", "AXOpaqueProviderGroup"):
-                # Make sure it contains chat buttons
-                for _, btn in walk_ax(child, max_depth=2):
-                    if ax_role(btn) == "AXButton" and ax_attr(btn, "AXDescription"):
-                        return el, child
+        scroll_candidates.append((y, x, el))
+
+    # Prefer the scroll area that sits lowest on screen — that's the
+    # conversation list below the tab switcher, not the message header.
+    scroll_candidates.sort(key=lambda t: -t[0])
+
+    for _, _, scroll_area in scroll_candidates:
+        for _, child in walk_ax(scroll_area, max_depth=8):
+            if ax_role(child) not in _PROJECT_CONTAINER_ROLES:
+                continue
+            for _, item in walk_ax(child, max_depth=3):
+                if ax_role(item) != "AXButton":
+                    continue
+                f2 = ax_frame(item)
+                if not f2 or f2[2] < 200:
+                    continue
+                desc = (ax_attr(item, "AXDescription") or "").strip()
+                if not desc:
+                    continue
+                log.info(
+                    "find_project_container: found container role=%s "
+                    "scroll_area_y=%d via AXButton desc=%r",
+                    ax_role(child),
+                    int(ax_frame(scroll_area)[1] if ax_frame(scroll_area) else 0),
+                    desc[:60],
+                )
+                return scroll_area, child
     return None, None
+
 
 def list_project_buttons(
     collection_list,
     viewport: tuple[float, float, float, float] | None = None,
 ) -> list[tuple[int, object, tuple[float, float, float, float], str]]:
-    """Return project conversation buttons from the center pane."""
+    """Return project conversation items from the center pane.
+
+    Accepts AXButton, AXCell, AXRow, and AXGroup elements — the exact type
+    depends on the ChatGPT version.  Title extraction falls back to child
+    AXStaticText nodes when AXDescription is absent.
+    """
     if collection_list is None:
         return []
     list_frame = ax_frame(collection_list)
@@ -374,21 +518,20 @@ def list_project_buttons(
         if not f:
             continue
         x, y, w, h = f
-        desc = (ax_attr(el, "AXDescription") or "").strip()
+        # Must be a plausible conversation card: wide enough, tall enough.
+        if w < 250 or h < 28:
+            continue
+        title = _item_title(el)
+        if not title:
+            continue
         rel_y = int(round(y - list_y))
-        
-        if not desc:
-            continue
-        # Project buttons are wide (e.g. 693x65)
-        if w < 300 or h < 30:
-            continue
-            
+
         if viewport is not None:
             vx, vy, vw, vh = viewport
             if not (y >= vy - 2 and (y + h) <= (vy + vh) + 2
                     and x >= vx - 2 and (x + w) <= (vx + vw) + 2):
                 continue
-        candidates.append((rel_y, el, (x, y, w, h), desc))
+        candidates.append((rel_y, el, (x, y, w, h), title))
 
     candidates.sort(key=lambda r: r[0])
     return candidates
@@ -486,6 +629,14 @@ def list_sidebar_buttons(
 
 
 def _scroll_sidebar(scroll_area_frame, amount: int) -> None:
+    if not _chatgpt_is_frontmost():
+        log.warning("_scroll_sidebar: ChatGPT not frontmost — re-activating before scroll")
+        activate_chatgpt(sleep=0.4)
+        if not _chatgpt_is_frontmost():
+            raise RuntimeError(
+                "ChatGPT.app is not frontmost and could not be re-activated. "
+                "Do not use other apps while the export is running."
+            )
     sx, sy, sw, sh = scroll_area_frame
     cg_move(sx + sw / 2, sy + sh / 2)
     time.sleep(0.03)
@@ -551,6 +702,83 @@ def enumerate_conversations(pid: int) -> list[Conversation]:
     for i, c in enumerate(out):
         c.index = i
     return out
+
+
+def discover_sidebar_projects(pid: int) -> list[str]:
+    """Return project names from the sidebar.
+
+    Sidebar layout (top → bottom):
+      ChatGPT button
+      GPTs section + sub-items  ← NOT projects
+      "New project" button       ← lower boundary
+      Project buttons            ← these are what we want
+      "See less" / "See more"    ← upper boundary
+      Conversation rows
+
+    We scroll to the top first so both boundary markers are always in view,
+    then filter to buttons that sit strictly between them. We do NOT filter
+    by button shape — projects and conversations can share identical pixel
+    dimensions; position is the only reliable differentiator.
+    """
+    window = _find_main_window(pid)
+    if window is None:
+        return []
+    scroll_area, collection = find_sidebar_container(window)
+    if collection is None:
+        return []
+
+    # Scroll to the top so "New project" and the projects section are visible.
+    sa_frame = ax_frame(scroll_area)
+    if sa_frame:
+        try:
+            for _ in range(15):
+                _scroll_sidebar(sa_frame, 20)
+            time.sleep(0.3)
+        except RuntimeError:
+            log.warning("discover_sidebar_projects: could not scroll to top (ChatGPT not frontmost); scanning current view")
+
+    list_frame = ax_frame(collection)
+    list_y = list_frame[1] if list_frame else 0.0
+
+    new_project_rel_y: int | None = None  # projects appear AFTER this y
+    divider_rel_y: int | None = None       # projects appear BEFORE this y
+    all_found: list[tuple[int, str]] = []
+
+    for _, el in walk_ax(collection, max_depth=10):
+        if ax_role(el) != "AXButton":
+            continue
+        f = ax_frame(el)
+        if not f:
+            continue
+        _, y, _, _ = f
+        desc = (ax_attr(el, "AXDescription") or "").strip()
+        rel_y = int(round(y - list_y))
+
+        if desc in ("See less", "See more"):
+            divider_rel_y = rel_y
+            continue
+        if desc == "New project":
+            new_project_rel_y = rel_y
+            continue
+        if not desc or desc in _SIDEBAR_SKIP_DESCS:
+            continue
+        all_found.append((rel_y, desc))
+
+    candidates = all_found[:]
+    if new_project_rel_y is not None:
+        candidates = [(ry, d) for ry, d in candidates if ry > new_project_rel_y]
+    if divider_rel_y is not None:
+        candidates = [(ry, d) for ry, d in candidates if ry < divider_rel_y]
+
+    candidates.sort(key=lambda r: r[0])
+    log.info(
+        "discover_sidebar_projects: new_project_rel_y=%s divider_rel_y=%s "
+        "total_found=%d after_filter=%d items=%s",
+        new_project_rel_y, divider_rel_y,
+        len(all_found), len(candidates),
+        [d for _, d in candidates],
+    )
+    return [d for _, d in candidates]
 
 
 # -------------------- Message pane location --------------------
@@ -827,12 +1055,18 @@ def find_message_pane(pid: int) -> tuple[
         if not frame:
             continue
         x, y, w, h = frame
-        if x < 240 or y < 0 or w < 600 or h < 200 or h > 2000:
+        # y < -500 would be truly off-screen; allow slightly negative y (-500..0)
+        # because in the project conversation view the pane can start a few pixels
+        # above the visible area without being truly hidden.
+        # w < 300 (not 600): in project view the content pane is only ~433px wide
+        # because the sidebar stays visible. Regular chat panes are ~741px.
+        if x < 240 or y < -500 or w < 300 or h < 200 or h > 2000:
             continue
         # Require an inner AXList/AXCollectionList — that's the message stream.
+        # Use depth 8 (up from 4) so we find the list even in deeper project panes.
         inner_list = None
-        for _, child in walk_ax(el, max_depth=4):
-            if ax_role(child) == "AXList":
+        for _, child in walk_ax(el, max_depth=8):
+            if ax_role(child) in ("AXList", "AXCollectionList"):
                 inner_list = child
                 break
         if inner_list is None:
@@ -1037,6 +1271,16 @@ def extract_messages_from_ax(
     center_y = py + ph / 2
     gutter_x = px + pw - 20  # near right edge, off any message bubble
 
+    # Ensure ChatGPT is frontmost before Quartz events. cg_click / cg_scroll
+    # go to whichever window is under the cursor, so we activate here.
+    # We warn-and-continue (not hard-fail) because when the script is launched
+    # from a terminal subprocess the parent IDE can briefly reclaim focus
+    # between activate_chatgpt() and this check; a hard-fail here silently
+    # swallows the entire extraction with no log entry.
+    if not _chatgpt_is_frontmost():
+        log.warning("extract_messages_from_ax: ChatGPT not frontmost — re-activating before extraction")
+        activate_chatgpt(sleep=0.5)
+
     # Focus the pane (click right-gutter, off bubbles) and blur the
     # composer so PageDown targets the message list, not the input box.
     cg_click(gutter_x, center_y)
@@ -1060,7 +1304,6 @@ def extract_messages_from_ax(
                 order_ref[0] += 1
                 added += 1
         total_chars = sum(len(c.desc) for c in store)
-        print(f"\r      ↳ Scrolling... extracted {total_chars} chars across {len(store)} blocks   ", end="", flush=True)
         top = _first_text_y(msg_list)
         log.info(
             "Extract %-18s ax_nodes=%3d captures=%3d chars=%6d (+%d) top_y=%s",
@@ -1087,6 +1330,16 @@ def extract_messages_from_ax(
     prev_total_chars = 0
 
     for step in range(MAX_PAGE_DOWNS):
+        # Re-check every 5 steps — catches focus loss from notifications or
+        # accidental user interaction without adding overhead on every tick.
+        if step % 5 == 0 and not _chatgpt_is_frontmost():
+            log.warning("extract: ChatGPT lost focus at step %d — re-activating", step)
+            activate_chatgpt(sleep=0.5)
+            if not _chatgpt_is_frontmost():
+                raise RuntimeError(
+                    f"ChatGPT.app lost focus at scroll step {step} and could not "
+                    "be re-activated. Do not use other apps during export."
+                )
         cg_scroll(-15)
         time.sleep(0.45)
         _capture(f"pgdn#{step + 1:02d}")
@@ -1357,12 +1610,14 @@ def _verify_click_switched(
     new_sig = prev_sig
     while time.time() < deadline:
         new_sig = _pane_signature(pid)
-        if (
-            new_sig
-            and new_sig != prev_sig
-            and new_sig not in ("(empty)", "(no-pane)", "(no-list)")
-        ):
-            return True, new_sig
+        if new_sig and new_sig != prev_sig:
+            if new_sig not in ("(empty)", "(no-pane)", "(no-list)"):
+                return True, new_sig
+            # Going from no-pane / no-list to an empty-but-visible pane IS a
+            # real switch — it means a conversation just opened from the project
+            # overview which has no message pane.
+            if prev_sig in ("(no-pane)", "(no-list)") and new_sig == "(empty)":
+                return True, new_sig
         time.sleep(_CLICK_VERIFY_POLL)
     return False, new_sig
 
@@ -1372,7 +1627,7 @@ def _blocks_fingerprint(blocks: list[tuple[str, str]]) -> str:
     used to detect the "same chat got extracted again" failure mode."""
     buf: list[str] = []
     total = 0
-    for _label, body in blocks:
+    for _, body in blocks:
         buf.append(body)
         total += len(body)
         if total >= _DEDUPE_HASH_LEN:
@@ -1602,121 +1857,118 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
     log.info("Initial pane signature: %s", current_sig)
 
     stuck = 0
-    progress = tqdm(unit="conv")
 
-    while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
-        # Re-read the sidebar scroll-area frame each iteration — in case
-        # the window was resized mid-run, viewport filtering stays honest.
-        live_sa_frame = ax_frame(scroll_area) or sa_frame
-        buttons = list_sidebar_buttons(collection, viewport=live_sa_frame)
-        unseen = [b for b in buttons if (b[3], b[0]) not in visited]
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Starting…", total=None)
 
-        if not unseen:
-            _scroll_sidebar(sa_frame, -SIDEBAR_STEP_LINES)
-            time.sleep(0.3)
-            stuck += 1
-            continue
+        while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
+            # Re-read the sidebar scroll-area frame each iteration — in case
+            # the window was resized mid-run, viewport filtering stays honest.
+            live_sa_frame = ax_frame(scroll_area) or sa_frame
+            buttons = list_sidebar_buttons(collection, viewport=live_sa_frame)
+            unseen = [b for b in buttons if (b[3], b[0]) not in visited]
 
-        rel_y, ax_ref, frame, title = unseen[0]
-        key = (title, rel_y)
-        visited.add(key)
-
-        cid = hashlib.sha1(f"{title}@{rel_y}".encode()).hexdigest()[:16]
-        if only_failed:
-            if cid not in failed_ids:
-                stuck = 0
-                continue
-        else:
-            if cid in done_ids:
-                stuck = 0
+            if not unseen:
+                _scroll_sidebar(sa_frame, -SIDEBAR_STEP_LINES)
+                time.sleep(0.3)
+                stuck += 1
                 continue
 
-        # Cheap re-activation — guarantees ChatGPT is frontmost so the
-        # click goes to it rather than to whatever window happens to be
-        # under the cursor. Apple Events no-ops when already frontmost.
-        activate_chatgpt(sleep=0.1)
+            rel_y, ax_ref, frame, title = unseen[0]
+            key = (title, rel_y)
+            visited.add(key)
 
-        # Resample sig RIGHT NOW so the verifier compares against the
-        # actual current state of the pane (not the post-click sig from
-        # the previous iteration, which is stale because extract scrolled
-        # to the bottom of that conversation in between).
-        live_sig = _pane_signature(pid)
-        log.info(
-            "--> Click row #%d '%s' rel_y=%d frame=(%d,%d %dx%d) live_sig=%s",
-            processed_count + 1, title, rel_y,
-            int(frame[0]), int(frame[1]), int(frame[2]), int(frame[3]),
-            live_sig,
-        )
+            cid = hashlib.sha1(f"{title}@{rel_y}".encode()).hexdigest()[:16]
+            if only_failed:
+                if cid not in failed_ids:
+                    stuck = 0
+                    continue
+            else:
+                if cid in done_ids:
+                    stuck = 0
+                    continue
 
-        ok, msg, current_sig = _process_one_row(
-            pid, rel_y, frame, ax_ref, title,
-            processed_count, state, args.delay,
-            live_sig, content_hashes,
-        )
-        processed_count += 1
-        progress.update(1)
-        progress.set_description_str(f"{'ok ' if ok else 'ERR'} {title[:40]}")
+            # Cheap re-activation — guarantees ChatGPT is frontmost so the
+            # click goes to it rather than to whatever window happens to be
+            # under the cursor. Apple Events no-ops when already frontmost.
+            activate_chatgpt(sleep=0.1)
 
-        if ok:
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            # Two failures in a row is a strong signal a modal popped
-            # up mid-run. Escape it and continue; costs nothing when
-            # no modal is present.
-            if consecutive_failures >= 2:
-                log.warning(
-                    "%d consecutive failures — checking for a modal and "
-                    "re-activating ChatGPT.", consecutive_failures,
-                )
-                _dismiss_modal_if_present(pid)
-                activate_chatgpt(sleep=0.2)
-
-        # Spot-check every 5 processed rows. The bug we're guarding
-        # against: every file ends up with the SAME content because
-        # clicks aren't switching chats. Symptom: dedupe guard rejects
-        # them (so failed grows), or — worse — sigs falsely report
-        # switches and writes go through with stale content.
-        #
-        # Hard sanity gate: if after the first 5 successful writes we
-        # have fewer than 4 unique content hashes, the run is broken.
-        # Abort instead of polluting the export folder with duplicates.
-        if processed_count % 5 == 0 and processed_count > 0:
-            n_done = len(state.get("done", []))
-            n_failed = len(state.get("failed", []))
-            n_unique = len(content_hashes)
+            # Resample sig RIGHT NOW so the verifier compares against the
+            # actual current state of the pane (not the post-click sig from
+            # the previous iteration, which is stale because extract scrolled
+            # to the bottom of that conversation in between).
+            live_sig = _pane_signature(pid)
             log.info(
-                "Spot check @ %d: done=%d failed=%d unique_content=%d",
-                processed_count, n_done, n_failed, n_unique,
+                "--> Click row #%d '%s' rel_y=%d frame=(%d,%d %dx%d) live_sig=%s",
+                processed_count + 1, title, rel_y,
+                int(frame[0]), int(frame[1]), int(frame[2]), int(frame[3]),
+                live_sig,
             )
-            print(
-                f"[spot check] {processed_count} processed, "
-                f"{n_unique} unique content, "
-                f"{n_failed} failed",
-                flush=True,
-            )
-            # n_done counts successfully-written files (dedupe-passed).
-            # If we have >= 5 done but unique hashes <= 1, every file
-            # is identical — bail out.
-            if n_done >= 5 and n_unique <= max(1, n_done - 4):
-                msg = (
-                    f"ABORTING: {n_done} files written but only {n_unique} "
-                    f"unique content hash(es). Click verification is being "
-                    f"fooled. Inspect ~/chatgpt_exports/.log and report."
-                )
-                log.error(msg)
-                print("\n" + msg, flush=True)
-                progress.close()
-                return 1
-        stuck = 0
 
-    progress.close()
+            progress.update(task, description=f"[cyan]{title[:50]}[/cyan]")
+            ok, _, current_sig = _process_one_row(
+                pid, rel_y, frame, ax_ref, title,
+                processed_count, state, args.delay,
+                live_sig, content_hashes,
+            )
+            processed_count += 1
+            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            progress.update(task, description=f"{status} {title[:48]}", advance=1)
+
+            if ok:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                # Two failures in a row is a strong signal a modal popped
+                # up mid-run. Escape it and continue; costs nothing when
+                # no modal is present.
+                if consecutive_failures >= 2:
+                    log.warning(
+                        "%d consecutive failures — checking for a modal and "
+                        "re-activating ChatGPT.", consecutive_failures,
+                    )
+                    _dismiss_modal_if_present(pid)
+                    activate_chatgpt(sleep=0.2)
+
+            # Spot-check every 5 processed rows.
+            if processed_count % 5 == 0 and processed_count > 0:
+                n_done = len(state.get("done", []))
+                n_failed = len(state.get("failed", []))
+                n_unique = len(content_hashes)
+                log.info(
+                    "Spot check @ %d: done=%d failed=%d unique_content=%d",
+                    processed_count, n_done, n_failed, n_unique,
+                )
+                console.log(
+                    f"[dim]Spot check: {processed_count} processed, "
+                    f"{n_unique} unique, {n_failed} failed[/dim]"
+                )
+                if n_done >= 5 and n_unique <= max(1, n_done - 4):
+                    abort_msg = (
+                        f"ABORTING: {n_done} files written but only {n_unique} "
+                        f"unique content hash(es). Click verification is being "
+                        f"fooled. Inspect ~/chatgpt_exports/.log and report."
+                    )
+                    log.error(abort_msg)
+                    console.print(f"\n[bold red]{abort_msg}[/bold red]")
+                    return 1
+            stuck = 0
 
     n_done = len(state.get("done", []))
     n_failed = len(state.get("failed", []))
-    print(f"Walk complete: visited {processed_count} new row(s); "
-          f"{n_done} total done, {n_failed} failed, "
-          f"{len(content_hashes)} unique content hashes.")
+    console.print(
+        f"Walk complete: [green]{processed_count}[/green] visited, "
+        f"[green]{n_done}[/green] done, [red]{n_failed}[/red] failed, "
+        f"{len(content_hashes)} unique."
+    )
     log.info(
         "Walk complete: processed=%d done_total=%d failed_total=%d unique_hashes=%d",
         processed_count, n_done, n_failed, len(content_hashes),
@@ -1726,19 +1978,70 @@ def walk_and_export(pid: int, state: dict, args: argparse.Namespace) -> int:
 
 # -------------------- Main --------------------
 
+def _navigate_to_project(pid: int, project_name: str) -> bool:
+    """Click the named project button in the sidebar to open its conversation list.
+    Returns True if the click was issued, False if the button was not found.
+    """
+    app = AXUIElementCreateApplication(pid)
+    wins = ax_attr(app, kAXWindowsAttribute) or []
+    for w in wins:
+        _, sidebar_col = find_sidebar_container(w)
+        if sidebar_col is None:
+            continue
+        for _, el in walk_ax(sidebar_col, max_depth=10):
+            if ax_role(el) != "AXButton":
+                continue
+            d = ax_attr(el, "AXDescription") or ax_attr(el, kAXTitleAttribute) or ""
+            if str(d).strip() == project_name:
+                AXUIElementPerformAction(el, kAXPressAction)
+                f = ax_frame(el)
+                if f:
+                    cg_click(f[0] + f[2] / 2, f[1] + f[3] / 2)
+                log.info("_navigate_to_project: clicked %r in sidebar", project_name)
+                return True
+    log.warning("_navigate_to_project: %r not found in sidebar", project_name)
+    return False
+
+
 def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> int:
     """Walk the project's internal conversation list."""
     app = AXUIElementCreateApplication(pid)
-    window = ax_attr(app, kAXFocusedWindowAttribute)
+    project_name = getattr(args, "project_name", "")
+
+    # Navigate to the project in the sidebar first so the conversation list is
+    # visible, then wait for ChatGPT to render it before searching the AX tree.
+    if project_name:
+        _navigate_to_project(pid, project_name)
+        time.sleep(1.5)
+
+    # Search ALL windows for the project container — _find_main_window skips
+    # windows titled "Edit project" (it's in _VIEW_MODE_TITLES), but the AX
+    # dump shows the conversation list IS inside that same window.
+    wins = ax_attr(app, kAXWindowsAttribute) or []
+    scroll_area, collection = None, None
+    window = None
+    for w in wins:
+        sa, col = find_project_container(w)
+        if sa is not None and col is not None:
+            scroll_area, collection, window = sa, col, w
+            break
+
+    # Fallback: try the focused window.
     if window is None:
-        wins = ax_attr(app, kAXWindowsAttribute)
-        window = wins[0] if wins else None
+        window = ax_attr(app, kAXFocusedWindowAttribute)
+        if window is None:
+            window = wins[0] if wins else None
+        if window is not None:
+            scroll_area, collection = find_project_container(window)
+
     if window is None:
         raise RuntimeError("No ChatGPT window found.")
-
-    scroll_area, collection = find_project_container(window)
     if scroll_area is None or collection is None:
-        raise RuntimeError("Could not locate the project conversation list in the center pane. Make sure the project is open.")
+        raise RuntimeError(
+            "Could not locate the project conversation list in the center pane.\n"
+            "Make sure the project is open in ChatGPT (click it in the sidebar so its\n"
+            "conversation list is visible), then re-run."
+        )
     sa_frame = ax_frame(scroll_area)
     if sa_frame is None:
         raise RuntimeError("Project scroll area has no frame.")
@@ -1747,10 +2050,9 @@ def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> 
     only_failed = bool(getattr(args, "retry_failed", False))
     failed_ids: set[str] = getattr(args, "_retry_cids", set()) if only_failed else set()
 
-    activate_chatgpt(sleep=0.3)
-    _sidebar_scroll_to_top(sa_frame)
+    activate_chatgpt(sleep=0.8)
 
-    visited: set[tuple[str, int]] = set()
+    visited: set[str] = set()
     content_hashes: set[str] = set()
     processed_count = 0
     limit = args.limit if args.limit else 10**9
@@ -1759,87 +2061,104 @@ def walk_and_export_project(pid: int, state: dict, args: argparse.Namespace) -> 
     log.info("Initial pane signature: %s", current_sig)
 
     stuck = 0
-    progress = tqdm(unit="conv")
+    prev_visible_titles: set[str] = set()
 
-    while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
-        live_sa_frame = ax_frame(scroll_area) or sa_frame
-        buttons = list_project_buttons(collection, viewport=live_sa_frame)
-        
-        unseen = [b for b in buttons if (b[3], b[0]) not in visited]
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Starting…", total=None)
 
-        if not unseen:
-            _scroll_sidebar(sa_frame, -SIDEBAR_STEP_LINES)
-            time.sleep(0.3)
-            stuck += 1
-            continue
+        while stuck < _SIDEBAR_STUCK_ROUNDS and processed_count < limit:
+            live_sa_frame = ax_frame(scroll_area) or sa_frame
+            buttons = list_project_buttons(collection, viewport=live_sa_frame)
 
-        rel_y, ax_ref, frame, title = unseen[0]
-        key = (title, rel_y)
-        visited.add(key)
+            current_visible_titles = {b[3] for b in buttons}
+            unseen = [b for b in buttons if b[3] not in visited]
 
-        cid = hashlib.sha1(f"proj_{title}@{rel_y}".encode()).hexdigest()[:16]
-        if only_failed:
-            if cid not in failed_ids:
-                stuck = 0
+            if not unseen:
+                _scroll_sidebar(sa_frame, -10)
+                time.sleep(0.4)
+                if current_visible_titles == prev_visible_titles:
+                    stuck += 1
+                else:
+                    stuck = 0
+                prev_visible_titles = current_visible_titles
                 continue
-        else:
-            if cid in done_ids:
-                stuck = 0
-                continue
 
-        activate_chatgpt(sleep=0.1)
-        live_sig = _pane_signature(pid)
-        log.info("--> Click project row #%d '%s'", processed_count + 1, title)
+            prev_visible_titles = set()
 
-        ok, msg, current_sig = _process_one_row(
-            pid, rel_y, frame, ax_ref, title,
-            processed_count, state, args.delay,
-            live_sig, content_hashes,
-        )
-        
-        processed_count += 1
-        progress.update(1)
-        progress.set_description_str(f"{'ok ' if ok else 'ERR'} {title[:40]}")
+            rel_y, ax_ref, frame, title = unseen[0]
+            visited.add(title)
 
-        if ok:
-            state.setdefault("project_done", []).append(cid)
-            save_checkpoint(state)
-            
-        # CRITICAL: Return back to the project list view before the next iteration
-        # In a project, clicking a chat opens it in the center. We must click the "Back" button
-        # or press the escape sequence to return to the project dashboard.
-        # It seems pressing the sidebar project button again is the safest way to return to the dashboard.
-        _press_home_button(pid) # Try home button first
-        time.sleep(1.0)
-        
-        # We need to find the specific project button in the sidebar and click it to go back.
-        # But actually, clicking the project name in the left sidebar again brings us back.
-        app = AXUIElementCreateApplication(pid)
-        window = ax_attr(app, kAXFocusedWindowAttribute)
-        if window is None:
-            wins = ax_attr(app, kAXWindowsAttribute)
-            window = wins[0] if wins else None
-        sidebar_scroll, sidebar_col = find_sidebar_container(window)
-        if sidebar_col:
-            # We don't know the exact project name easily, but it's currently selected or visible.
-            # Let's just find the first visible project button and click it? No, wait. 
-            # In the dump you provided, the left sidebar still has "Product Strategy Prep" visible.
-            for _, el in walk_ax(sidebar_col, max_depth=5):
-                if ax_role(el) == "AXButton":
-                    d = ax_attr(el, "AXDescription")
-                    if d and "Prep" in str(d): # Rough heuristic to click back
-                        AXUIElementPerformAction(el, kAXPressAction)
-                        break
-        time.sleep(1.0)
-        
-        # We must re-find the project container after returning
-        scroll_area, collection = find_project_container(window)
+            cid = hashlib.sha1(f"proj_{title}".encode()).hexdigest()[:16]
+            if only_failed:
+                if cid not in failed_ids:
+                    stuck = 0
+                    continue
+            else:
+                if cid in done_ids:
+                    stuck = 0
+                    continue
 
-        stuck = 0
+            activate_chatgpt(sleep=0.1)
+            live_sig = _pane_signature(pid)
+            log.info("--> Click project row #%d '%s'", processed_count + 1, title)
 
-    progress.close()
+            progress.update(task, description=f"[cyan]{title[:50]}[/cyan]")
+            ok, _, current_sig = _process_one_row(
+                pid, rel_y, frame, ax_ref, title,
+                processed_count, state, args.delay,
+                live_sig, content_hashes,
+            )
+
+            processed_count += 1
+            status = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            progress.update(task, description=f"{status} {title[:48]}", advance=1)
+
+            if ok:
+                state.setdefault("project_done", []).append(cid)
+                save_checkpoint(state)
+
+            # Return to the project list view before the next iteration.
+            project_name = getattr(args, "project_name", "")
+
+            app = AXUIElementCreateApplication(pid)
+            window = ax_attr(app, kAXFocusedWindowAttribute)
+            if window is None:
+                wins = ax_attr(app, kAXWindowsAttribute)
+                window = wins[0] if wins else None
+
+            _, sidebar_col = find_sidebar_container(window)
+            if sidebar_col and project_name:
+                for _, el in walk_ax(sidebar_col, max_depth=10):
+                    if ax_role(el) == "AXButton":
+                        d = ax_attr(el, "AXDescription")
+                        if d and str(d).strip() == project_name:
+                            AXUIElementPerformAction(el, kAXPressAction)
+                            f = ax_frame(el)
+                            if f:
+                                cg_click(f[0] + f[2] / 2, f[1] + f[3] / 2)
+                            break
+            else:
+                log.warning("No project name or sidebar not found; trying Escape.")
+                osa_key_code(KEY_ESCAPE)
+
+            time.sleep(1.5)
+
+            scroll_area, collection = find_project_container(window)
+            stuck = 0
+
     n_done = len(state.get("project_done", []))
-    print(f"\nProject Walk complete: visited {processed_count} new row(s); {n_done} total exported.")
+    console.print(
+        f"Project walk complete: [green]{processed_count}[/green] visited, "
+        f"[green]{n_done}[/green] exported."
+    )
     return 0
 
 def parse_args() -> argparse.Namespace:
@@ -1849,54 +2168,115 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--retry-failed", action="store_true", help="Only retry previously failed ones.")
     ap.add_argument("--debug", action="store_true", help="Dump AX tree to .ax_dump.txt.")
     ap.add_argument("--project", action="store_true", help="Export conversations from an open project.")
+    ap.add_argument("--project-name", type=str, default="", help="The name of the project to return to after extracting a chat.")
     ap.add_argument("--delay", type=float, default=INTER_CONV_DELAY,
                     help="Seconds between conversations.")
     return ap.parse_args()
 
 
+def _print_completion_summary(state: dict) -> None:
+    n_done = len(state.get("done", []) + state.get("project_done", []))
+    n_failed = len(state.get("failed", []))
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    table.add_column(justify="right", style="bold", width=6)
+    table.add_column()
+    table.add_row("[green]✓[/green]", f"[green]{n_done}[/green] conversation(s) exported")
+    if n_failed:
+        table.add_row("[red]✗[/red]", f"[red]{n_failed}[/red] failed — re-run with [bold]--retry-failed[/bold]")
+    table.add_row("[dim]📁[/dim]", f"[dim]{OUTPUT_DIR}[/dim]")
+    table.add_row("[dim]📄[/dim]", f"[dim]Log: {LOG_PATH}[/dim]")
+    console.print(Panel(table, title="[bold green]Complete[/bold green]", border_style="green"))
+
+
 def main() -> int:
     args = parse_args()
+    global OUTPUT_DIR, CHECKPOINT_PATH, LOG_PATH, AX_DUMP_PATH, log
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    global log
     log = setup_logging()
 
-    if not (args.dry_run or getattr(args, 'limit', 0) or getattr(args, 'retry_failed', False) or getattr(args, 'project', False)):
-        print("\n" + "=" * 50)
-        print("  ChatGPT Desktop Exporter")
-        print("=" * 50)
-        print("This tool uses macOS Accessibility to physically click and scroll")
-        print("through your conversations, exporting them to ~/chatgpt_exports/\n")
-        print("Choose an option:")
-        print("  1. Export all main sidebar conversations")
-        print("  2. Export conversations from an OPEN project")
-        print("  3. Exit")
-        choice = ""
-        while choice not in ("1", "2", "3"):
-            try:
-                choice = input("\nEnter your choice (1/2/3): ").strip()
-            except EOFError:
-                return 1
-        if choice == "3":
-            return 0
-        elif choice == "2":
-            args.project = True
-            
-    if not check_accessibility():
-        print(
-            "ERROR: macOS Accessibility permission is not granted.\n"
-            "Grant it under System Settings -> Privacy & Security -> Accessibility.\n"
-            "Add the terminal you are running this script from (Terminal.app, iTerm, etc.)\n"
-            "and/or Python itself, then re-run.",
-            file=sys.stderr,
-        )
+    # Always show the welcome banner.
+    print_welcome()
+
+    # Pre-flight runs for every mode.
+    ok, pid = preflight_check()
+    if not ok:
         return 2
 
-    activate_chatgpt()
-    pid = find_chatgpt_pid()
-    if pid is None:
-        print("ERROR: ChatGPT app is not running. Open ChatGPT.app and log in first.",
-              file=sys.stderr)
-        return 2
+    assert pid is not None
+
+    # --- Interactive mode: show TUI when no CLI flags were passed ---
+    in_interactive_mode = not (
+        args.dry_run or args.limit or args.retry_failed or args.project
+    )
+
+    if in_interactive_mode:
+        # Main menu
+        choice = questionary.select(
+            "What would you like to do?",
+            choices=[
+                questionary.Choice("🗂️  Export all standard conversations", value="sidebar"),
+                questionary.Choice("📁  Export conversations from a Project", value="project"),
+                questionary.Choice("🔄  Retry previously failed conversations", value="retry"),
+                questionary.Choice("🔍  Dry run (list conversations only)", value="dryrun"),
+                questionary.Choice("❌  Exit", value="exit"),
+            ],
+        ).ask()
+
+        if choice is None or choice == "exit":
+            console.print("[dim]Bye![/dim]")
+            return 0
+
+        if choice == "project":
+            args.project = True
+            console.print("[dim]Scanning sidebar for projects…[/dim]")
+            activate_chatgpt(sleep=0.4)
+            projects = discover_sidebar_projects(pid)
+            if projects:
+                project_name = questionary.select(
+                    "Which project would you like to export?",
+                    choices=projects + ["↩  Enter name manually"],
+                ).ask()
+                if project_name == "↩  Enter name manually" or project_name is None:
+                    project_name = questionary.text(
+                        "Enter the EXACT project name as shown in the sidebar:",
+                    ).ask()
+            else:
+                console.print(Panel(
+                    "[yellow]No projects were detected automatically.[/yellow]\n\n"
+                    "This usually means one of:\n"
+                    "  • The ChatGPT sidebar is scrolled down past the Projects section\n"
+                    "  • The sidebar is collapsed — open it with [bold]Cmd+Shift+S[/bold]\n"
+                    "  • You have no projects yet in ChatGPT\n\n"
+                    "If you do have projects, scroll the ChatGPT sidebar all the way\n"
+                    "to the top so they are visible, then re-run this script.\n\n"
+                    "You can also type the project name manually below.",
+                    title="[bold yellow]Projects not found[/bold yellow]",
+                    border_style="yellow",
+                ))
+                project_name = questionary.text(
+                    "Enter the EXACT project name as shown in the sidebar:",
+                    instruction="(e.g. 'Product Strategy Prep')",
+                ).ask()
+
+            if not project_name:
+                console.print("[red]No project name entered. Exiting.[/red]")
+                return 1
+            args.project_name = project_name.strip()
+
+        elif choice == "retry":
+            args.retry_failed = True
+
+        elif choice == "dryrun":
+            args.dry_run = True
+
+    # Handle project output directory
+    if getattr(args, "project", False) and getattr(args, "project_name", ""):
+        safe_name = slugify(args.project_name, max_words=10, max_len=100)
+        OUTPUT_DIR = OUTPUT_DIR / safe_name
+        CHECKPOINT_PATH = OUTPUT_DIR / ".checkpoint.json"
+        LOG_PATH = OUTPUT_DIR / ".log"
+        AX_DUMP_PATH = OUTPUT_DIR / ".ax_dump.txt"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.debug:
         app = AXUIElementCreateApplication(pid)
@@ -1906,69 +2286,88 @@ def main() -> int:
             window = wins[0] if wins else None
         if window is not None:
             dump_ax_tree(window, AX_DUMP_PATH)
-            print(f"AX tree dumped to {AX_DUMP_PATH}")
+            console.print(f"[dim]AX tree dumped to {AX_DUMP_PATH}[/dim]")
 
-    # --dry-run keeps the old enumerate-only path: it scrolls the sidebar
-    # top-to-bottom once and prints every row it finds. The live export
-    # path uses walk_and_export instead — which re-queries rows with
-    # fresh frames between clicks to sidestep stale AXUIElementRefs.
     if args.dry_run:
-        print("Enumerating sidebar conversations (dry run)...")
-        convs = enumerate_conversations(pid)
-        print(f"Found {len(convs)} conversations.")
+        console.print("[bold]Dry run[/bold] — enumerating sidebar (nothing will be saved)…")
+        activate_chatgpt()
+        try:
+            convs = enumerate_conversations(pid)
+        except RuntimeError as e:
+            console.print(Panel(
+                f"[red]{e}[/red]\n\n"
+                "Make sure ChatGPT.app is [bold]not minimized[/bold] and the sidebar is visible,\n"
+                "then re-run.",
+                title="[bold red]Window Not Found[/bold red]",
+                border_style="red",
+            ))
+            return 2
         log.info("Enumerated %d conversations (dry run)", len(convs))
+        tbl = Table(
+            title=f"[bold]{len(convs)} Conversations Found[/bold]",
+            box=box.SIMPLE_HEAD,
+            show_lines=False,
+            highlight=True,
+        )
+        tbl.add_column("#", justify="right", style="dim", width=4)
+        tbl.add_column("Title", style="bold white")
         for c in convs:
-            print(f"  #{c.index + 1:>4}  rel_y={c.rel_y:>5}  cid={c.cid}  {c.title}")
+            tbl.add_row(str(c.index + 1), c.title)
+        console.print(tbl)
         return 0
 
     state = load_checkpoint()
 
     if args.retry_failed:
-        # Snapshot the failed-cid set onto args so the walker can filter
-        # by it, then clear state['failed'] — any row that fails again
-        # this run will be re-appended; any row that succeeds drops off.
         args._retry_cids = {f["id"] for f in state.get("failed", [])}  # type: ignore[attr-defined]
-        print(f"Retrying {len(args._retry_cids)} previously failed conversation(s).")  # type: ignore[attr-defined]
+        n_retry = len(args._retry_cids)  # type: ignore[attr-defined]
+        console.print(f"[yellow]Retrying {n_retry} previously failed conversation(s).[/yellow]")
         state["failed"] = []
     else:
-        print(f"Exporting all unfinished conversations to {OUTPUT_DIR}")
+        console.print(f"Exporting conversations → [bold cyan]{OUTPUT_DIR}[/bold cyan]")
 
-    print("Do NOT touch mouse or keyboard. Move cursor to a screen corner to abort (failsafe).")
+    console.print(Panel(
+        "[bold yellow]⚠  Do NOT touch the mouse or keyboard during the export.[/bold yellow]\n\n"
+        "  • [bold]Keep ChatGPT.app frontmost[/bold] — the script sends raw mouse/scroll events\n"
+        "    to whichever window is under the cursor. Switching to VS Code, Safari,\n"
+        "    or any other app will redirect those events to the wrong target.\n"
+        "  • [bold]Do not minimize ChatGPT.app.[/bold] The Accessibility API cannot see minimized windows.\n"
+        "  • [dim]Move cursor to any screen corner to abort (failsafe). Progress is checkpointed.[/dim]",
+        title="[bold yellow]Before you continue[/bold yellow]",
+        border_style="yellow",
+    ))
     time.sleep(2.0)
+    activate_chatgpt()
 
     try:
-        if getattr(args, 'project', False):
+        if getattr(args, "project", False):
             walk_and_export_project(pid, state, args)
         else:
             walk_and_export(pid, state, args)
-        
-        # Automatically retry failed conversations once at the end
-        if not getattr(args, 'retry_failed', False) and state.get('failed'):
-            n_failed = len(state.get('failed'))
-            print(f"\n*** First pass complete. Automatically retrying {n_failed} failed conversation(s)... ***")
-            # Set up for a retry pass
+
+        # Auto-retry once on first-pass failures
+        if not getattr(args, "retry_failed", False) and state.get("failed"):
+            n_failed = len(state["failed"])
+            console.print(f"\n[yellow]First pass done. Auto-retrying {n_failed} failed conversation(s)…[/yellow]")
             args.retry_failed = True
-            args._retry_cids = {f['id'] for f in state.get('failed', [])}
-            state['failed'] = []
-            # Run the walk again
-            if getattr(args, 'project', False):
+            args._retry_cids = {f["id"] for f in state["failed"]}
+            state["failed"] = []
+            if getattr(args, "project", False):
                 walk_and_export_project(pid, state, args)
             else:
                 walk_and_export(pid, state, args)
 
     except KeyboardInterrupt:
         save_checkpoint(state)
-        print("\nInterrupted. Re-run the script to resume from checkpoint.")
+        console.print("\n[yellow]Interrupted.[/yellow] Re-run to resume from checkpoint.")
         return 130
     except pyautogui.FailSafeException:
         save_checkpoint(state)
-        print("\nFailsafe triggered (mouse in corner). Checkpoint saved.")
+        console.print("\n[yellow]Failsafe triggered (mouse in corner).[/yellow] Checkpoint saved.")
         return 130
 
     save_checkpoint(state)
-    n_done = len(state.get("done", []))
-    n_failed = len(state.get("failed", []))
-    print(f"Done. {n_done} exported, {n_failed} failed. See {LOG_PATH} for details.")
+    _print_completion_summary(state)
     return 0
 
 
