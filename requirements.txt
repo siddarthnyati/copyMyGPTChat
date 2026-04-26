@@ -1,0 +1,7 @@
+pyobjc-framework-ApplicationServices>=10.0
+pyobjc-framework-Cocoa>=10.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+tqdm>=4.66.0
+rich>=13.0.0
+questionary>=2.0.0
